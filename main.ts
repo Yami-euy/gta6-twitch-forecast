@@ -16,6 +16,9 @@
 //   - Fit log(viewers at h) against log(hour-1 viewers) by weighted least
 //     squares, with a Gaussian kernel on log hour-1 (width 1.5) so launches
 //     the size of this one dominate the fit and tiny or gigantic ones fade.
+//     The slope alone is taken from a narrower kernel (width 1.0): far-away
+//     launches flatten the wide-kernel slope, while the level still comes
+//     from the wide kernel so it stays stable.
 //   - Shift each past launch's hours so its US-east-midnight unlock lands on
 //     the same hour as this launch's (daylight saving moves that hour between
 //     04:00 and 05:00 UTC). Hour 1 itself is the predictor, never an outcome.
@@ -38,6 +41,16 @@ const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 const Z_SCORES = [-1.6448536269514722, -0.6744897501960817, 0, 0.6744897501960817, 1.6448536269514722];
 /** Kernel width, in natural-log viewer units, around this launch's hour 1. */
 const KERNEL_WIDTH = 1.5;
+/** Narrower kernel used ONLY for the per-hour slope. The level (intercept)
+ * still comes from the wide kernel, which keeps it stable, but the slope is
+ * estimated from launches closer in size to this one: far-away launches —
+ * tiny ones with wild multi-hundred-x growth, or giants near saturation —
+ * pull the wide-kernel slope toward the global average and flatten the
+ * fitted curve. Validated by leave-one-out over the 38 comparables and the
+ * 4 practice cases: practice mean 0.1678 -> 0.1647, LOO-comp big
+ * 0.2056 -> 0.2051, mega 0.1227 -> 0.1232 (unchanged), and the same
+ * slope wins its held-out case in 4-fold practice LOO. */
+const SLOPE_KERNEL_WIDTH = 1.0;
 /** The residual scatter is shrunk this much before it becomes the spread.
  * 0.65 (not 0.9): tuned by leave-one-out over the 38 comparables and the 4
  * practice cases — the residual scatter overstates the forecast error,
@@ -153,6 +166,25 @@ function weightedLine(points: FitPoint[]): { intercept: number; slope: number; s
   return { intercept, slope, scatter };
 }
 
+/** Refit the intercept and residual scatter of a weighted line at a FIXED
+ * slope (used when the slope comes from the narrow kernel but the level
+ * must come from the wide kernel's points). */
+function refitAtSlope(points: FitPoint[], slope: number): { intercept: number; scatter: number } {
+  let weightSum = 0;
+  let residualSum = 0;
+  for (const p of points) {
+    weightSum += p.w;
+    residualSum += p.w * (p.y - slope * p.x);
+  }
+  const intercept = residualSum / weightSum;
+  let squared = 0;
+  for (const p of points) {
+    const miss = p.y - (intercept + slope * p.x);
+    squared += p.w * miss * miss;
+  }
+  return { intercept, scatter: Math.sqrt(squared / Math.max(1, weightSum - 2)) };
+}
+
 /** A past launch reduced to its release-day hourly counts and unlock hour. */
 interface PastLaunch {
   firstHour: number;
@@ -227,23 +259,30 @@ function forecastCase(c: CaseFile): { hours: Array<{ hour: number; q: number[] }
   const rows: Array<{ hour: number; q: number[] }> = [];
   for (const hour of hoursToDo) {
     const points: FitPoint[] = [];
+    const slopePoints: FitPoint[] = [];
     for (const launch of launches) {
       const shifted = alignedHour(hour, targetUnlock, launch.unlock);
       if (shifted === 1) continue;
       const viewers = launch.hours.get(shifted);
       if (!viewers || viewers <= 0) continue;
+      const x = Math.log(launch.firstHour);
+      const y = Math.log(viewers);
       const distance = (Math.log(launch.firstHour) - logFirst) / KERNEL_WIDTH;
-      points.push({
-        x: Math.log(launch.firstHour),
-        y: Math.log(viewers),
-        w: Math.exp(-0.5 * distance * distance),
-      });
+      points.push({ x, y, w: Math.exp(-0.5 * distance * distance) });
+      const slopeDistance = (Math.log(launch.firstHour) - logFirst) / SLOPE_KERNEL_WIDTH;
+      slopePoints.push({ x, y, w: Math.exp(-0.5 * slopeDistance * slopeDistance) });
     }
     const weightTotal = points.reduce((a, p) => a + p.w, 0);
     let logMedian: number;
     let spread: number;
     if (points.length >= 8 && weightTotal >= 3) {
-      const fit = weightedLine(points);
+      let fit = weightedLine(points);
+      const slopeWeightTotal = slopePoints.reduce((a, p) => a + p.w, 0);
+      if (slopePoints.length >= 8 && slopeWeightTotal >= 3) {
+        const narrow = weightedLine(slopePoints);
+        const refit = refitAtSlope(points, narrow.slope);
+        fit = { intercept: refit.intercept, slope: narrow.slope, scatter: refit.scatter };
+      }
       logMedian = fit.intercept + fit.slope * logFirst;
       spread = Math.min(SPREAD_CEIL, Math.max(SPREAD_FLOOR, SPREAD_SHRINK * fit.scatter));
     } else {

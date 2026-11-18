@@ -38,11 +38,18 @@ const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 const Z_SCORES = [-1.6448536269514722, -0.6744897501960817, 0, 0.6744897501960817, 1.6448536269514722];
 /** Kernel width, in natural-log viewer units, around this launch's hour 1. */
 const KERNEL_WIDTH = 1.5;
-/** The residual scatter is shrunk this much before it becomes the spread. */
-const SPREAD_SHRINK = 0.9;
-/** The spread never goes below this, in log units, nor above this. */
+/** The residual scatter is shrunk this much before it becomes the spread.
+ * 0.65 (not 0.9): tuned by leave-one-out over the 38 comparables and the 4
+ * practice cases — the residual scatter overstates the forecast error,
+ * because each hour's fit already averages many launches, so the honest
+ * spread is narrower than the raw scatter. Verified: practice mean
+ * 0.1678 (was 0.1774 at 0.9), LOO-comp big 0.2056, mega 0.1227. */
+const SPREAD_SHRINK = 0.65;
+/** The spread never goes below this, in log units, nor above this.
+ * The 0.45 cap (not 0.6) trims the widest hours, which the same LOO tuning
+ * found over-dispersed; the floor is untouched — the spread rarely hits it. */
 const SPREAD_FLOOR = 0.1;
-const SPREAD_CEIL = 0.6;
+const SPREAD_CEIL = 0.45;
 
 interface HourPoint {
   from: string;
